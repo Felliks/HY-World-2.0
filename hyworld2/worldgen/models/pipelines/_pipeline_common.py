@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Union
 import PIL
 import regex as re
 import torch
+import torch.distributed as dist
 from diffusers.image_processor import PipelineImageInput
 from diffusers.utils import is_ftfy_available
 from diffusers.utils.torch_utils import randn_tensor
@@ -85,13 +86,15 @@ class KeyframePipelineMixin:
         self.image_processor = image_processor
         self._manual_cpu_offload_enabled = False
         self._manual_execution_device = None
+        self._manual_distributed_sync = False
 
     def _pipeline_execution_device(self):
         execution_device = self._execution_device
         return execution_device() if callable(execution_device) else execution_device
 
-    def enable_manual_cpu_offload(self, device=None):
+    def enable_manual_cpu_offload(self, device=None, sync_distributed: bool = False):
         self._manual_cpu_offload_enabled = True
+        self._manual_distributed_sync = sync_distributed
         self._manual_execution_device = torch.device(device) if device is not None else self._pipeline_execution_device()
         for model_name in ("text_encoder", "image_encoder", "vae"):
             self._offload_model_to_cpu(model_name)
@@ -102,19 +105,45 @@ class KeyframePipelineMixin:
             return self._manual_execution_device
         return self._pipeline_execution_device()
 
+    def _module_device(self, model):
+        for tensor_iter in (model.parameters, model.buffers):
+            try:
+                tensor = next(tensor_iter())
+            except StopIteration:
+                continue
+            except TypeError:
+                continue
+            return tensor.device
+        return getattr(model, "device", None)
+
+    def _manual_offload_barrier(self, label: str = ""):
+        if not self._manual_cpu_offload_enabled or not self._manual_distributed_sync:
+            return
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
     def _ensure_model_on_device(self, model_name: str):
         model = getattr(self, model_name, None)
         if model is None or not self._manual_cpu_offload_enabled:
             return model
-        model.to(self._manual_target_device())
+        target_device = torch.device(self._manual_target_device())
+        current_device = self._module_device(model)
+        if current_device == target_device:
+            return model
+        model.to(target_device)
         return model
 
     def _offload_model_to_cpu(self, model_name: str):
         model = getattr(self, model_name, None)
         if model is None or not self._manual_cpu_offload_enabled:
             return
-        model.to("cpu")
-        if torch.cuda.is_available():
+        target_device = torch.device("cpu")
+        current_device = self._module_device(model)
+        if current_device == target_device:
+            return
+        was_on_cuda = current_device is not None and current_device.type == "cuda"
+        model.to(target_device)
+        if was_on_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _get_t5_prompt_embeds(

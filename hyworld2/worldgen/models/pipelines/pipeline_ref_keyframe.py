@@ -165,6 +165,7 @@ class KFPCDControllerRefPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLo
             device=device,
         )
         self._offload_model_to_cpu("text_encoder")
+        self._manual_offload_barrier("after_text_encode")
 
         # Encode image embedding
         transformer_dtype = self.transformer.dtype
@@ -176,6 +177,7 @@ class KFPCDControllerRefPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLo
             self._ensure_model_on_device("image_encoder")
             image_embeds = self.encode_image(image, device)
             self._offload_model_to_cpu("image_encoder")
+            self._manual_offload_barrier("after_image_encode")
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
@@ -218,6 +220,7 @@ class KFPCDControllerRefPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLo
             reference_latent = None
             ref_noise = None
         self._offload_model_to_cpu("vae")
+        self._manual_offload_barrier("before_denoise")
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -296,6 +299,7 @@ class KFPCDControllerRefPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLo
             self._offload_model_to_cpu("vae")
         else:
             video = latents
+        self._manual_offload_barrier("after_vae_decode")
 
         # Offload all models
         self.maybe_free_model_hooks()

@@ -82,3 +82,61 @@ def test_video_gen_reuses_generated_frames_without_mp4_decode_roundtrip():
     assert "generated_frames = tensor_video_to_pil_frames(output)" in source
     assert "memory_bank.update_memory(gen_frames=generated_frames" in source
     assert "Reload results for memory update" not in source
+
+
+def test_pipeline_manual_offload_is_idempotent_and_syncs_only_explicit_boundaries():
+    common = read_source("models/pipelines/_pipeline_common.py")
+
+    assert "def _module_device" in common
+    assert "current_device == target_device" in common
+    assert "was_on_cuda" in common
+    assert "def _manual_offload_barrier" in common
+    assert "dist.is_initialized()" in common
+
+    for relative_path in (
+        "models/pipelines/pipeline_dmd_keyframe.py",
+        "models/pipelines/pipeline_ref_keyframe.py",
+        "models/pipelines/pipeline_pcd_keyframe.py",
+    ):
+        source = read_source(relative_path)
+        assert "_manual_offload_barrier(\"after_text_encode\")" in source
+        assert "_manual_offload_barrier(\"before_denoise\")" in source
+        assert "_manual_offload_barrier(\"after_vae_decode\")" in source
+
+
+def test_camera_selector_uses_batched_dinov2_and_optional_disk_cache():
+    retrieval = read_source("src/retrieval_wm.py")
+    video_gen = read_source("video_gen.py")
+
+    assert "cache_dinov2_features" in retrieval
+    assert ".dinov2_cache" in retrieval
+    assert "def _feature_cache_key" in retrieval
+    assert "self.processor(images=pil_images, return_tensors=\"pt\")" in retrieval
+    assert "pooler_output.cpu().numpy()" in retrieval
+    assert "del inputs, outputs" in retrieval
+    assert "--cache_dinov2_features" in video_gen
+    assert "cache_dinov2_features=args.cache_dinov2_features" in video_gen
+
+
+def test_lazy_aux_init_synchronises_distributed_ranks():
+    retrieval = read_source("src/retrieval_wm.py")
+
+    assert "def _distributed_barrier" in retrieval
+    assert "dist.is_initialized()" in retrieval
+    assert "dist.get_world_size() > 1" in retrieval
+    assert "self._distributed_barrier(\"before_aux_init\")" in retrieval
+    assert "self._distributed_barrier(\"after_aux_init\")" in retrieval
+
+
+def test_video_validation_uses_quick_probe_per_rank_vram_and_tolerant_range_check():
+    video_gen = read_source("video_gen.py")
+    general_utils = read_source("src/general_utils.py")
+
+    assert "mp4_quick_check" in general_utils
+    assert "from src.general_utils import set_seed, load_video, rank0_log, Timer, mp4_quick_check" in video_gen
+    assert "if not mp4_quick_check(path):" in video_gen
+    assert "torch.cuda.current_device()" in video_gen
+    assert "torch.cuda.memory_allocated(device=cuda_device)" in video_gen
+    assert "print(f\"[VRAM rank{rank}]" in video_gen
+    assert "TENSOR_RANGE_EPSILON" in video_gen
+    assert "raise ValueError(f\"Unexpected video tensor range" in video_gen

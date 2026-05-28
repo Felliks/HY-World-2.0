@@ -17,7 +17,7 @@ from transformers import Sam3VideoModel, Sam3VideoProcessor
 
 from models.worldstereo_wrapper import WorldStereo
 from src.data_utils import sort_trajs, load_mutli_traj_dataset
-from src.general_utils import set_seed, load_video, rank0_log, Timer
+from src.general_utils import set_seed, load_video, rank0_log, Timer, mp4_quick_check
 from src.retrieval_wm import PanoramaMemoryBank
 from src.sp_utils.parallel_states import initialize_parallel_state
 
@@ -26,6 +26,7 @@ timer = Timer()
 
 SAM3_REPO_ID = "facebook/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
+TENSOR_RANGE_EPSILON = 0.05
 
 
 def clear_cuda_cache():
@@ -36,14 +37,19 @@ def clear_cuda_cache():
 def log_cuda_memory(label, enabled=True):
     if not enabled or not torch.cuda.is_available():
         return
-    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
-    rank0_log(f"[VRAM] {label}: allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB peak={max_allocated:.2f}GiB")
+    cuda_device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device=cuda_device) / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved(device=cuda_device) / (1024 ** 3)
+    max_allocated = torch.cuda.max_memory_allocated(device=cuda_device) / (1024 ** 3)
+    rank = int(os.getenv("RANK", 0))
+    print(f"[VRAM rank{rank}] {label}: allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB peak={max_allocated:.2f}GiB", flush=True)
 
 
 def load_validated_video(path, expected_frames=None):
     if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return None
+    if not mp4_quick_check(path):
+        rank0_log(f"Invalid cached video {path}: failed quick MP4 probe", "WARNING")
         return None
     try:
         frames = load_video(path)
@@ -64,13 +70,16 @@ def validate_video_file(path, expected_frames=None):
 
 
 def tensor_video_to_pil_frames(video):
-    video_np = video.permute(0, 2, 3, 1).numpy()
+    video_np = video.detach().cpu().permute(0, 2, 3, 1).numpy()
     if np.issubdtype(video_np.dtype, np.floating):
+        min_value = float(video_np.min()) if video_np.size else 0.0
         max_value = float(video_np.max()) if video_np.size else 0.0
-        if max_value <= 1.5:
+        if min_value >= -TENSOR_RANGE_EPSILON and max_value <= 1.0 + TENSOR_RANGE_EPSILON:
             video_uint8 = (np.clip(video_np, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-        else:
+        elif min_value >= -TENSOR_RANGE_EPSILON and max_value <= 255.0 + TENSOR_RANGE_EPSILON:
             video_uint8 = np.clip(video_np, 0.0, 255.0).round().astype(np.uint8)
+        else:
+            raise ValueError(f"Unexpected video tensor range [{min_value}, {max_value}]")
     else:
         video_uint8 = np.clip(video_np, 0, 255).astype(np.uint8)
     return [Image.fromarray(frame).convert("RGB") for frame in video_uint8]
@@ -114,6 +123,7 @@ if __name__ == '__main__':
     parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile for T5/VAE to reduce one-off startup memory and compile overhead")
     parser.add_argument("--offload_mode", default="none", choices=["none", "manual", "model", "sequential"], help="CPU offload mode for WorldStereo submodules")
     parser.add_argument("--log_vram", action="store_true", help="Log CUDA allocated/reserved/peak memory at major stage boundaries")
+    parser.add_argument("--cache_dinov2_features", action="store_true", help="Cache CameraSelector DINOv2 image features under render_results/.dinov2_cache")
     parser.add_argument("--seed", default=1024, type=int, help="Random seed")
 
     args = parser.parse_args()
@@ -221,7 +231,7 @@ if __name__ == '__main__':
                                                  max_reference=args.max_reference, align_nframe=args.align_nframe, rank=sp_rank, world_size=sp_size, moge_model=moge_model,
                                                  sam3_model=sam3_model, sam3_processor=sam3_processor, results_name=args.model_type, valid_threshold=0.15, pts_num=args.downsampled_pts,
                                                  kb_anomaly_percentile=args.kb_anomaly_percentile, pcd_nb_neighbors=args.pcd_nb_neighbors, pcd_std_ratio=args.pcd_std_ratio,
-                                                 defer_aux_models=args.lazy_aux_models)
+                                                 defer_aux_models=args.lazy_aux_models, cache_dinov2_features=args.cache_dinov2_features)
             log_cuda_memory("after memory bank init", args.log_vram)
 
             for render_path in render_list:

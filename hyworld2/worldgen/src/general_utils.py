@@ -105,6 +105,24 @@ def load_video(video_path):
     return frames
 
 
+def mp4_quick_check(video_path):
+    """Cheap MP4 probe for obvious corrupt files. Passing this does not replace full decode validation."""
+    try:
+        size = os.path.getsize(video_path)
+        if size < 1024:
+            return False
+        with open(video_path, "rb") as f:
+            head = f.read(min(size, 4096))
+            if b"ftyp" not in head[:16]:
+                return False
+            f.seek(max(0, size - 4096))
+            tail = f.read()
+        sample = head + tail
+        return b"moov" in sample or b"mdat" in sample
+    except OSError:
+        return False
+
+
 def get_last_video_frame(video_path):
     """decord supports random access, so read the last frame directly by index."""
     vr = VideoReader(video_path, ctx=cpu(0))

@@ -177,6 +177,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
                 device=device,
             )
         self._offload_model_to_cpu("text_encoder")
+        self._manual_offload_barrier("after_text_encode")
 
         # Encode image embedding
         transformer_dtype = self.transformer.dtype
@@ -189,6 +190,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             with torch.no_grad():
                 image_embeds = self.encode_image(image, device)
             self._offload_model_to_cpu("image_encoder")
+            self._manual_offload_barrier("after_image_encode")
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
@@ -246,6 +248,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             else:
                 reference_latent = None
         self._offload_model_to_cpu("vae")
+        self._manual_offload_barrier("before_denoise")
 
         # 6. Denoising loop 55-60% 8-9s
         num_warmup_steps = 0
@@ -339,6 +342,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             self._offload_model_to_cpu("vae")
         else:
             video = latents
+        self._manual_offload_barrier("after_vae_decode")
 
         # Offload all models
         self.maybe_free_model_hooks()

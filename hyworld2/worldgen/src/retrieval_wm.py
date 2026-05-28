@@ -1,11 +1,12 @@
 import collections
+import hashlib
 import json
 import math
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import cv2
 import einops
@@ -408,10 +409,15 @@ class CameraSelector:
     def __init__(
             self,
             feature_extractor='dinov2',
-            device: str = 'cuda'
+            device: str = 'cuda',
+            cache_root: Optional[str] = None,
+            cache_dinov2_features: bool = False,
     ):
         self.device = device
         self.feature_extractor = feature_extractor
+        self.cache_root = cache_root
+        self.cache_dinov2_features = cache_dinov2_features
+        self.cache_dir = os.path.join(cache_root, ".dinov2_cache") if cache_root else None
         self.model = None
         self.transform = None
         self.processor = None
@@ -440,6 +446,53 @@ class CameraSelector:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _feature_cache_key(self, images: List[np.ndarray]) -> str:
+        digest = hashlib.sha1()
+        digest.update(self.feature_extractor.encode("utf-8"))
+        for img in images:
+            arr = np.ascontiguousarray(img)
+            digest.update(str(arr.shape).encode("utf-8"))
+            digest.update(str(arr.dtype).encode("utf-8"))
+            digest.update(arr.tobytes())
+        return digest.hexdigest()
+
+    def _feature_cache_path(self, images: List[np.ndarray]) -> Optional[str]:
+        if not self.cache_dinov2_features or self.feature_extractor != "dinov2" or self.cache_dir is None:
+            return None
+        return os.path.join(self.cache_dir, f"{self._feature_cache_key(images)}.npy")
+
+    def _read_feature_cache(self, images: List[np.ndarray]) -> Optional[np.ndarray]:
+        cache_path = self._feature_cache_path(images)
+        if cache_path is None or not os.path.exists(cache_path):
+            return None
+        try:
+            features = np.load(cache_path)
+        except (OSError, ValueError) as exc:
+            rank0_log(f"Failed to read DINOv2 feature cache {cache_path}: {exc}", "WARNING")
+            return None
+        if features.shape[0] != len(images):
+            rank0_log(f"Ignoring DINOv2 feature cache with stale shape {features.shape}: {cache_path}", "WARNING")
+            return None
+        return features
+
+    def _write_feature_cache(self, images: List[np.ndarray], features: np.ndarray):
+        cache_path = self._feature_cache_path(images)
+        if cache_path is None:
+            return
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                np.save(f, features)
+            os.replace(tmp_path, cache_path)
+        except OSError as exc:
+            rank0_log(f"Failed to write DINOv2 feature cache {cache_path}: {exc}", "WARNING")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
     @torch.no_grad()
     def extract_image_features(self, images: List[np.ndarray]) -> np.ndarray:
         """
@@ -452,27 +505,42 @@ class CameraSelector:
             features: (N, D) feature vectors.
         """
 
+        cached_features = self._read_feature_cache(images)
+        if cached_features is not None:
+            return cached_features
+
         self.ensure_model()
-        features = []
         try:
-            for img in images:
-                # RGB -> PIL
-                img_pil = Image.fromarray(img)
+            if self.feature_extractor != 'dinov2':
+                raise ValueError(f"Unknown feature extractor: {self.feature_extractor}")
 
-                # Extract
-                if self.feature_extractor == 'dinov2':
-                    with torch.no_grad():
-                        inputs = self.processor(images=img_pil, return_tensors="pt")
-                        inputs.pixel_values = inputs.pixel_values.to(self.device)
-                        feat = self.model(pixel_values=inputs.pixel_values).pooler_output  # (1, 768)
-                else:
-                    raise ValueError(f"Unknown feature extractor: {self.feature_extractor}")
-
-                features.append(feat.cpu().numpy().flatten())
+            pil_images = [Image.fromarray(img) for img in images]
+            inputs = None
+            outputs = None
+            try:
+                inputs = self.processor(images=pil_images, return_tensors="pt")
+                inputs.pixel_values = inputs.pixel_values.to(self.device)
+                outputs = self.model(pixel_values=inputs.pixel_values)
+                features = outputs.pooler_output.cpu().numpy()
+                del inputs, outputs
+            except RuntimeError as exc:
+                rank0_log(f"Batched DINOv2 extraction failed, falling back to single-image extraction: {exc}", "WARNING")
+                del inputs, outputs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                feature_chunks = []
+                for img_pil in pil_images:
+                    inputs = self.processor(images=img_pil, return_tensors="pt")
+                    inputs.pixel_values = inputs.pixel_values.to(self.device)
+                    outputs = self.model(pixel_values=inputs.pixel_values)
+                    feature_chunks.append(outputs.pooler_output.cpu().numpy())
+                    del inputs, outputs
+                features = np.concatenate(feature_chunks, axis=0)
         finally:
             self.offload_model()
 
-        return np.array(features)
+        self._write_feature_cache(images, features)
+        return features
 
     def compute_image_quality_scores(self, images: List[np.ndarray]) -> np.ndarray:
         """
@@ -731,7 +799,8 @@ class PanoramaMemoryBank:
                  kb_anomaly_percentile=90,
                  pcd_nb_neighbors=10,
                  pcd_std_ratio=2.0,
-                 defer_aux_models=False):
+                 defer_aux_models=False,
+                 cache_dinov2_features=False):
         # loading panorama info
         self.root_path = root_path
         self.image_width = image_width
@@ -776,12 +845,17 @@ class PanoramaMemoryBank:
         self.kb_anomaly_percentile = kb_anomaly_percentile  # Percentile threshold for abnormal k,b detection; P90 means P90 of max_relative_deviation is the inlier upper bound.
 
         self.max_reference = max_reference
-        self.camera_selector = CameraSelector(camera_selector, device=device)
-
         if results_name is None:
             self.results_path = "generation_bank"
         else:
             self.results_path = f"generation_bank_{results_name}"
+
+        self.camera_selector = CameraSelector(
+            camera_selector,
+            device=device,
+            cache_root=f"{root_path}/render_results",
+            cache_dinov2_features=cache_dinov2_features,
+        )
 
         self._points = None
 
@@ -840,8 +914,13 @@ class PanoramaMemoryBank:
         else:
             self.ensure_aux_models(device=device)
 
+    def _distributed_barrier(self, label: str = ""):
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
     def ensure_aux_models(self, device=None):
         device = device or self.device
+        self._distributed_barrier("before_aux_init")
         rank0_log("Ensuring MoGe/SAM3 models are initialized for memory alignment.")
         if self.moge_model is None:
             rank0_log("Initializing Moge Model...")
@@ -857,6 +936,7 @@ class PanoramaMemoryBank:
         self.sam3_model.to(device, dtype=torch.bfloat16)
         self.sam3_model.eval()
         self._aux_models_deferred = False
+        self._distributed_barrier("after_aux_init")
         return self.moge_model, self.sam3_model, self.sam3_processor
 
     def get_points(self):

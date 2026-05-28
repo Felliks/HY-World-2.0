@@ -459,7 +459,8 @@ class WorldStereo:
             return pipeline
         if offload_mode == "manual":
             rank0_log("Enabling manual CPU offload for WorldStereo aux modules.")
-            return pipeline.enable_manual_cpu_offload(device=device)
+            sync_distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+            return pipeline.enable_manual_cpu_offload(device=device, sync_distributed=sync_distributed)
         if offload_mode == "model":
             rank0_log("Enabling diffusers model CPU offload for WorldStereo.")
             pipeline.enable_model_cpu_offload(device=device)
