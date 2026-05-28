@@ -164,6 +164,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             batch_size = prompt_embeds.shape[0]
 
         # 3. Encode input prompt 2-3% 0.3-0.4s
+        self._ensure_model_on_device("text_encoder")
         with torch.no_grad():
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -175,6 +176,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
                 max_sequence_length=max_sequence_length,
                 device=device,
             )
+        self._offload_model_to_cpu("text_encoder")
 
         # Encode image embedding
         transformer_dtype = self.transformer.dtype
@@ -183,8 +185,10 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         if image_embeds is None:
+            self._ensure_model_on_device("image_encoder")
             with torch.no_grad():
                 image_embeds = self.encode_image(image, device)
+            self._offload_model_to_cpu("image_encoder")
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
@@ -196,6 +200,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
 
         # 5. Prepare latent variables 31% 4.5-4.8s -> 0.5s -> 0.1s (next version)
         num_channels_latents = self.vae.config.z_dim
+        self._ensure_model_on_device("vae")
         image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
             latents, condition = self.prepare_latents(
@@ -240,6 +245,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
                 reference_latent = torch.cat([reference_latent, reference_latent_mask, reference_latent], dim=1)
             else:
                 reference_latent = None
+        self._offload_model_to_cpu("vae")
 
         # 6. Denoising loop 55-60% 8-9s
         num_warmup_steps = 0
@@ -325,15 +331,17 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
 
         # 7. decode latent 2.5% 0.38s
         if not output_type == "latent":
+            self._ensure_model_on_device("vae")
             latents = latents.to(self.vae.dtype)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
                 video = keyframe_vae_decode(self.vae, latents, rescale=True)  # (b, c, f, h, w)
             video = self.video_processor.postprocess_video(video, output_type=output_type)
+            self._offload_model_to_cpu("vae")
         else:
             video = latents
 
         # Offload all models
-        # self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         if not return_dict:
             return (video,)

@@ -248,6 +248,7 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
             batch_size = prompt_embeds.shape[0]
 
         # 3. Encode input prompt
+        self._ensure_model_on_device("text_encoder")
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -258,6 +259,7 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
             max_sequence_length=max_sequence_length,
             device=device,
         )
+        self._offload_model_to_cpu("text_encoder")
 
         # Encode image embedding
         transformer_dtype = self.transformer.dtype
@@ -266,7 +268,9 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         if image_embeds is None:
+            self._ensure_model_on_device("image_encoder")
             image_embeds = self.encode_image(image, device)
+            self._offload_model_to_cpu("image_encoder")
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
@@ -276,6 +280,7 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
 
         # 5. Prepare latent variables
         num_channels_latents = self.vae.config.z_dim
+        self._ensure_model_on_device("vae")
         image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
         latents, condition = self.prepare_latents(
             image,
@@ -307,6 +312,7 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
             )
             render_latent = retrieve_latents(self.vae.encode(render_video), sample_mode="argmax")
             render_latent = (render_latent - latents_mean) * latents_std
+        self._offload_model_to_cpu("vae")
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -374,9 +380,11 @@ class KFPCDControllerPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLoraL
         self._current_timestep = None
 
         if not output_type == "latent":
+            self._ensure_model_on_device("vae")
             latents = latents.to(self.vae.dtype)
             video = keyframe_vae_decode(self.vae, latents, rescale=True)  # (b, c, f, h, w)
             video = self.video_processor.postprocess_video(video, output_type=output_type)
+            self._offload_model_to_cpu("vae")
         else:
             video = latents
 

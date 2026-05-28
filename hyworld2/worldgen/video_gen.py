@@ -26,6 +26,56 @@ timer = Timer()
 SAM3_REPO_ID = "facebook/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 
+
+def clear_cuda_cache():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def log_cuda_memory(label, enabled=True):
+    if not enabled or not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    rank0_log(f"[VRAM] {label}: allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB peak={max_allocated:.2f}GiB")
+
+
+def validate_video_file(path, expected_frames=None):
+    if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return False
+    try:
+        frames = load_video(path)
+    except Exception as exc:
+        rank0_log(f"Invalid cached video {path}: {exc}", "WARNING")
+        return False
+    if not frames:
+        rank0_log(f"Invalid cached video {path}: zero frames", "WARNING")
+        return False
+    if expected_frames is not None and len(frames) != expected_frames:
+        rank0_log(f"Invalid cached video {path}: expected {expected_frames} frames, got {len(frames)}", "WARNING")
+        return False
+    return True
+
+
+def move_aux_models_to_cuda(moge_model, sam3_model, device):
+    rank0_log("Moving MoGe/SAM3 to CUDA for memory alignment.")
+    if moge_model is not None:
+        moge_model.to(device)
+    if sam3_model is not None:
+        sam3_model.to(device, dtype=torch.bfloat16)
+    clear_cuda_cache()
+
+
+def move_aux_models_to_cpu(moge_model, sam3_model):
+    rank0_log("Moving MoGe/SAM3 to CPU.")
+    if moge_model is not None:
+        moge_model.to("cpu")
+    if sam3_model is not None:
+        sam3_model.to("cpu")
+    clear_cuda_cache()
+
+
 if __name__ == '__main__':
     # == parse configs ==
     parser = argparse.ArgumentParser()
@@ -41,6 +91,11 @@ if __name__ == '__main__':
     parser.add_argument("--local_files_only", action="store_true", help="If True, avoid downloading the file and return the path to the local cached file if it exists.")
     parser.add_argument("--fsdp", action="store_true", help="Enable FSDP model sharding")
     parser.add_argument("--skip_exist", action="store_true", help="skip existing videos")
+    parser.add_argument("--strict_skip_validation", action="store_true", help="Validate cached mp4 files before reusing them with --skip_exist")
+    parser.add_argument("--lazy_aux_models", action="store_true", help="Load MoGe/SAM3 only when memory alignment starts")
+    parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile for T5/VAE to reduce one-off startup memory and compile overhead")
+    parser.add_argument("--offload_mode", default="none", choices=["none", "manual", "model", "sequential"], help="CPU offload mode for WorldStereo submodules")
+    parser.add_argument("--log_vram", action="store_true", help="Log CUDA allocated/reserved/peak memory at major stage boundaries")
     parser.add_argument("--seed", default=1024, type=int, help="Random seed")
 
     args = parser.parse_args()
@@ -75,11 +130,18 @@ if __name__ == '__main__':
     print(f"Global rank:{dist.get_rank()}, Local rank:{local_rank}, SP_rank:{sp_rank}, SP_group:{data_rank}, seed:{global_seed}.")
 
     # == setup models ==
-    # Note: FP8 quantization is done INSIDE init_wan_from_cfg, BEFORE FSDP sharding
-    moge_model = MoGeModel.from_pretrained(MOGE_ID).to(device)
-    sam3_model = Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(device, dtype=torch.bfloat16)
-    sam3_processor = Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID)
-    rank0_log("Model init over...")
+    # MoGe/SAM3 are needed for memory alignment, not for WorldStereo denoising.
+    if args.lazy_aux_models:
+        moge_model = None
+        sam3_model = None
+        sam3_processor = None
+        rank0_log("Lazy aux model mode: MoGe/SAM3 will be loaded before memory alignment.")
+    else:
+        moge_model = MoGeModel.from_pretrained(MOGE_ID).eval()
+        sam3_model = Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(dtype=torch.bfloat16).eval()
+        sam3_processor = Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID)
+        rank0_log("Aux model init over...")
+    log_cuda_memory("after aux model setup", args.log_vram)
 
     # reset it to the fp32 as we make diffusion scheduler in fp32
     torch.set_default_dtype(torch.float)
@@ -93,7 +155,10 @@ if __name__ == '__main__':
         fsdp=args.fsdp,
         device_mesh=device_mesh,
         device=device,
+        compile_models=not args.no_compile,
+        offload_mode=args.offload_mode,
     )
+    log_cuda_memory("after WorldStereo init", args.log_vram)
     dist.barrier()
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
@@ -137,7 +202,9 @@ if __name__ == '__main__':
                 memory_bank = PanoramaMemoryBank(root_path=scene, image_width=width, image_height=height, device=device, nframe=worldstereo.cfg.nframe,
                                                  max_reference=args.max_reference, align_nframe=args.align_nframe, rank=sp_rank, world_size=sp_size, moge_model=moge_model,
                                                  sam3_model=sam3_model, sam3_processor=sam3_processor, results_name=args.model_type, valid_threshold=0.15, pts_num=args.downsampled_pts,
-                                                 kb_anomaly_percentile=args.kb_anomaly_percentile, pcd_nb_neighbors=args.pcd_nb_neighbors, pcd_std_ratio=args.pcd_std_ratio)
+                                                 kb_anomaly_percentile=args.kb_anomaly_percentile, pcd_nb_neighbors=args.pcd_nb_neighbors, pcd_std_ratio=args.pcd_std_ratio,
+                                                 defer_aux_models=args.lazy_aux_models)
+            log_cuda_memory("after memory bank init", args.log_vram)
 
             for render_path in render_list:
                 with timer.track("[IO] Loading cameras"):
@@ -148,9 +215,23 @@ if __name__ == '__main__':
                     tar_w2cs = torch.from_numpy(np.array(target_cameras["extrinsic"])).to(dtype=torch.float32, device=device)
                     tar_Ks = torch.from_numpy(np.array(target_cameras["intrinsic"])).to(dtype=torch.float32, device=device)
 
-                    if args.skip_exist and os.path.exists(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"):
+                    result_video_path = f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"
+                    expected_frames = tar_w2cs.shape[0] if tar_w2cs.shape[0] <= worldstereo.cfg.nframe else worldstereo.cfg.nframe
+                    if args.skip_exist and os.path.exists(result_video_path):
+                        if args.strict_skip_validation and not validate_video_file(result_video_path, expected_frames=expected_frames):
+                            rank0_log(f"Cached result failed validation and will be regenerated: {result_video_path}", "WARNING")
+                            if rank == 0:
+                                os.remove(result_video_path)
+                            dist.barrier()
+                        else:
+                            if memory_bank is not None:  # Only update the memory bank
+                                gen_frames = load_video(result_video_path)
+                                memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
+                            continue
+
+                    if args.skip_exist and os.path.exists(result_video_path):
                         if memory_bank is not None:  # Only update the memory bank
-                            gen_frames = load_video(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4")
+                            gen_frames = load_video(result_video_path)
                             memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
                         continue
 
@@ -191,33 +272,46 @@ if __name__ == '__main__':
 
                 # pipeline inference
                 with timer.track("Video Model Inference"), torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                    output = worldstereo.pipeline(**pipeline_kwargs).frames[0].float()
+                    output = worldstereo.pipeline(**pipeline_kwargs).frames[0].float().cpu()
+                log_cuda_memory(f"after video inference {view_id}/{traj_id}", args.log_vram)
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                del meta_data, pipeline_kwargs
+                clear_cuda_cache()
 
                 if dist.get_rank() % sp_size == 0:
                     with timer.track("[IO] Save Results"):
                         # [f,c,h,w]->[f,h,w,c]
-                        output = output.permute(0, 2, 3, 1).cpu().numpy()
-                        export_to_video(output, f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4", fps=16)
+                        output = output.permute(0, 2, 3, 1).numpy()
+                        export_to_video(output, result_video_path, fps=16)
                 dist.barrier()
+                del output
+                clear_cuda_cache()
 
                 # update memory bank
                 if memory_bank is not None:
                     with timer.track("[IO] Reload results for memory update* (need to be optimized)"):
-                        gen_frames = load_video(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4")
+                        gen_frames = load_video(result_video_path)
                     memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
                 dist.barrier()
 
             if memory_bank is not None:
+                rank0_log("Releasing WorldStereo before World Mirror and memory alignment.")
+                del worldstereo
+                clear_cuda_cache()
+                log_cuda_memory("after releasing WorldStereo", args.log_vram)
+
                 with timer.track("Run World Mirror"):
                     memory_bank.apply_worldmirror(skip_exist=True)
                 dist.barrier()
+                log_cuda_memory("after World Mirror", args.log_vram)
 
+                memory_bank.ensure_aux_models(device=device)
+                move_aux_models_to_cuda(memory_bank.moge_model, memory_bank.sam3_model, device)
                 with timer.track("Memory bank Alignment"):
                     memory_bank.alignment(debug_mode=False)
                 dist.barrier()
+                move_aux_models_to_cpu(memory_bank.moge_model, memory_bank.sam3_model)
+                log_cuda_memory("after memory alignment", args.log_vram)
 
                 # memory bank over, export pcd
                 with timer.track("[IO] Save final aligned pointcloud (update memory)"):

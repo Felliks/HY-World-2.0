@@ -127,6 +127,8 @@ class WorldStereo:
         fsdp: bool = False,
         device_mesh=None,
         device: torch.device | None = None,
+        compile_models: bool = True,
+        offload_mode: str = "none",
     ) -> "WorldStereo":
         """
         Build a WorldStereo instance from Hugging Face format
@@ -184,8 +186,19 @@ class WorldStereo:
             device=device,
         )
 
+        aux_fsdp = fsdp and offload_mode != "manual"
+        aux_load_on_device = offload_mode != "manual"
+        if fsdp and offload_mode == "manual":
+            rank0_log("Manual offload keeps T5/CLIP/VAE unsharded on CPU; transformer FSDP remains enabled.")
+
         text_encoder, image_clip, vae = cls._load_aux(
-            cfg, device=device, device_mesh=device_mesh, fsdp=fsdp, local_files_only=local_files_only
+            cfg,
+            device=device,
+            device_mesh=device_mesh,
+            fsdp=aux_fsdp,
+            local_files_only=local_files_only,
+            compile_models=compile_models,
+            load_on_device=aux_load_on_device,
         )
         image_processor = CLIPImageProcessor.from_pretrained(
             cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
@@ -204,6 +217,7 @@ class WorldStereo:
             device=device,
             local_files_only=local_files_only,
         )
+        pipeline = cls._apply_offload_mode(pipeline, offload_mode=offload_mode, device=device)
 
         rank0_log(f"WorldStereo ({model_type}) ready.")
         return cls(pipeline=pipeline, cfg=cfg)
@@ -344,7 +358,16 @@ class WorldStereo:
         return transformer.eval()
 
     @staticmethod
-    def _load_aux(cfg, *, device, device_mesh, fsdp: bool, local_files_only: bool = False):
+    def _load_aux(
+        cfg,
+        *,
+        device,
+        device_mesh,
+        fsdp: bool,
+        local_files_only: bool = False,
+        compile_models: bool = True,
+        load_on_device: bool = True,
+    ):
         import transformers as _tr
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
@@ -356,7 +379,8 @@ class WorldStereo:
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
             text_encoder.encoder.embed_tokens = text_encoder.shared
-        text_encoder = torch.compile(text_encoder)
+        if compile_models:
+            text_encoder = torch.compile(text_encoder)
 
         # ---- image encoder ----
         rank0_log("Loading ImageEncoder (CLIP)…")
@@ -397,7 +421,8 @@ class WorldStereo:
         vae = AutoencoderKLWan.from_pretrained(
             cfg.base_model, subfolder="vae", torch_dtype=vae_dtype, local_files_only=local_files_only
         ).eval()
-        vae = torch.compile(vae)
+        if compile_models:
+            vae = torch.compile(vae)
 
         if fsdp:
             fsdp_kwargs = dict(
@@ -420,11 +445,30 @@ class WorldStereo:
             gc.collect()
             torch.cuda.empty_cache()
         else:
-            text_encoder = text_encoder.to(device=device)
-            image_clip = image_clip.to(device=device)
+            if load_on_device:
+                text_encoder = text_encoder.to(device=device)
+                image_clip = image_clip.to(device=device)
 
-        vae = vae.to(device=device)
+        if load_on_device:
+            vae = vae.to(device=device)
         return text_encoder, image_clip, vae
+
+    @staticmethod
+    def _apply_offload_mode(pipeline, *, offload_mode: str, device):
+        if offload_mode == "none":
+            return pipeline
+        if offload_mode == "manual":
+            rank0_log("Enabling manual CPU offload for WorldStereo aux modules.")
+            return pipeline.enable_manual_cpu_offload(device=device)
+        if offload_mode == "model":
+            rank0_log("Enabling diffusers model CPU offload for WorldStereo.")
+            pipeline.enable_model_cpu_offload(device=device)
+            return pipeline
+        if offload_mode == "sequential":
+            rank0_log("Enabling diffusers sequential CPU offload for WorldStereo.")
+            pipeline.enable_sequential_cpu_offload(device=device)
+            return pipeline
+        raise ValueError(f"Unsupported offload_mode {offload_mode!r}. Expected one of: none, manual, model, sequential.")
 
     @staticmethod
     def _build_pipeline(

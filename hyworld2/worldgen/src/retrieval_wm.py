@@ -713,7 +713,8 @@ class PanoramaMemoryBank:
                  percentile_threshold=20,
                  kb_anomaly_percentile=90,
                  pcd_nb_neighbors=10,
-                 pcd_std_ratio=2.0):
+                 pcd_std_ratio=2.0,
+                 defer_aux_models=False):
         # loading panorama info
         self.root_path = root_path
         self.image_width = image_width
@@ -812,26 +813,39 @@ class PanoramaMemoryBank:
         self.align_start_index = self.mem_size
         rank0_log(f"Initialized panorama memory size: {self.mem_size}")
 
-        rank0_log(f"Initializing Moge Model...")
-        if moge_model is None:
-            self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
-        else:
-            self.moge_model = moge_model
-        self.moge_model.eval()
-
-        rank0_log(f"Initializing SAM3 Model...")
-        if sam3_model is None or sam3_processor is None:
-            from transformers import Sam3VideoModel, Sam3VideoProcessor
-            self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16)
-            self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
-        else:
-            self.sam3_model = sam3_model
-            self.sam3_processor = sam3_processor
-
         self.min_depth = 0.05
         self.device = device
         self.rank = rank
         self.world_size = world_size
+        self.moge_model = moge_model
+        self.sam3_model = sam3_model
+        self.sam3_processor = sam3_processor
+        self._aux_models_deferred = defer_aux_models and (
+            self.moge_model is None or self.sam3_model is None or self.sam3_processor is None
+        )
+        if self._aux_models_deferred:
+            rank0_log("Deferring MoGe/SAM3 initialization until memory alignment.")
+        else:
+            self.ensure_aux_models(device=device)
+
+    def ensure_aux_models(self, device=None):
+        device = device or self.device
+        rank0_log("Ensuring MoGe/SAM3 models are initialized for memory alignment.")
+        if self.moge_model is None:
+            rank0_log("Initializing Moge Model...")
+            self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal")
+        self.moge_model.to(device)
+        self.moge_model.eval()
+
+        if self.sam3_model is None or self.sam3_processor is None:
+            rank0_log("Initializing SAM3 Model...")
+            from transformers import Sam3VideoModel, Sam3VideoProcessor
+            self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3")
+            self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+        self.sam3_model.to(device, dtype=torch.bfloat16)
+        self.sam3_model.eval()
+        self._aux_models_deferred = False
+        return self.moge_model, self.sam3_model, self.sam3_processor
 
     def export_pcd(self, save_path, N_points=2_000_000):
         """
@@ -1318,6 +1332,7 @@ class PanoramaMemoryBank:
         return float('inf'), {}
 
     def alignment(self, debug_mode=False):
+        self.ensure_aux_models(device=self.device)
         # =====================================================================
         # Phase 1: Build the global video mapping and assign videos to different ranks.
         # =====================================================================

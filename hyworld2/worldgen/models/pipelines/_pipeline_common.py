@@ -83,10 +83,39 @@ class KeyframePipelineMixin:
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
         self.image_processor = image_processor
+        self._manual_cpu_offload_enabled = False
+        self._manual_execution_device = None
 
     def _pipeline_execution_device(self):
         execution_device = self._execution_device
         return execution_device() if callable(execution_device) else execution_device
+
+    def enable_manual_cpu_offload(self, device=None):
+        self._manual_cpu_offload_enabled = True
+        self._manual_execution_device = torch.device(device) if device is not None else self._pipeline_execution_device()
+        for model_name in ("text_encoder", "image_encoder", "vae"):
+            self._offload_model_to_cpu(model_name)
+        return self
+
+    def _manual_target_device(self):
+        if self._manual_execution_device is not None:
+            return self._manual_execution_device
+        return self._pipeline_execution_device()
+
+    def _ensure_model_on_device(self, model_name: str):
+        model = getattr(self, model_name, None)
+        if model is None or not self._manual_cpu_offload_enabled:
+            return model
+        model.to(self._manual_target_device())
+        return model
+
+    def _offload_model_to_cpu(self, model_name: str):
+        model = getattr(self, model_name, None)
+        if model is None or not self._manual_cpu_offload_enabled:
+            return
+        model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _get_t5_prompt_embeds(
         self,
