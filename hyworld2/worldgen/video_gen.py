@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from diffusers.utils import export_to_video
 from moge.model.v2 import MoGeModel
+from PIL import Image
 from torch.distributed.device_mesh import init_device_mesh
 from tqdm import tqdm
 from transformers import Sam3VideoModel, Sam3VideoProcessor
@@ -41,21 +42,38 @@ def log_cuda_memory(label, enabled=True):
     rank0_log(f"[VRAM] {label}: allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB peak={max_allocated:.2f}GiB")
 
 
-def validate_video_file(path, expected_frames=None):
+def load_validated_video(path, expected_frames=None):
     if not os.path.exists(path) or os.path.getsize(path) < 1024:
-        return False
+        return None
     try:
         frames = load_video(path)
     except Exception as exc:
         rank0_log(f"Invalid cached video {path}: {exc}", "WARNING")
-        return False
+        return None
     if not frames:
         rank0_log(f"Invalid cached video {path}: zero frames", "WARNING")
-        return False
+        return None
     if expected_frames is not None and len(frames) != expected_frames:
         rank0_log(f"Invalid cached video {path}: expected {expected_frames} frames, got {len(frames)}", "WARNING")
-        return False
-    return True
+        return None
+    return frames
+
+
+def validate_video_file(path, expected_frames=None):
+    return load_validated_video(path, expected_frames=expected_frames) is not None
+
+
+def tensor_video_to_pil_frames(video):
+    video_np = video.permute(0, 2, 3, 1).numpy()
+    if np.issubdtype(video_np.dtype, np.floating):
+        max_value = float(video_np.max()) if video_np.size else 0.0
+        if max_value <= 1.5:
+            video_uint8 = (np.clip(video_np, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        else:
+            video_uint8 = np.clip(video_np, 0.0, 255.0).round().astype(np.uint8)
+    else:
+        video_uint8 = np.clip(video_np, 0, 255).astype(np.uint8)
+    return [Image.fromarray(frame).convert("RGB") for frame in video_uint8]
 
 
 def move_aux_models_to_cuda(moge_model, sam3_model, device):
@@ -218,22 +236,20 @@ if __name__ == '__main__':
                     result_video_path = f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"
                     expected_frames = tar_w2cs.shape[0] if tar_w2cs.shape[0] <= worldstereo.cfg.nframe else worldstereo.cfg.nframe
                     if args.skip_exist and os.path.exists(result_video_path):
-                        if args.strict_skip_validation and not validate_video_file(result_video_path, expected_frames=expected_frames):
+                        if args.strict_skip_validation:
+                            gen_frames = load_validated_video(result_video_path, expected_frames=expected_frames)
+                        else:
+                            gen_frames = load_video(result_video_path)
+
+                        if gen_frames is None:
                             rank0_log(f"Cached result failed validation and will be regenerated: {result_video_path}", "WARNING")
                             if rank == 0:
                                 os.remove(result_video_path)
                             dist.barrier()
                         else:
                             if memory_bank is not None:  # Only update the memory bank
-                                gen_frames = load_video(result_video_path)
                                 memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
                             continue
-
-                    if args.skip_exist and os.path.exists(result_video_path):
-                        if memory_bank is not None:  # Only update the memory bank
-                            gen_frames = load_video(result_video_path)
-                            memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
-                        continue
 
                 # All ranks run retrieval; sequence-parallel rendering happens inside.
                 with timer.track("Memory Retrieval"):
@@ -281,17 +297,17 @@ if __name__ == '__main__':
                 if dist.get_rank() % sp_size == 0:
                     with timer.track("[IO] Save Results"):
                         # [f,c,h,w]->[f,h,w,c]
-                        output = output.permute(0, 2, 3, 1).numpy()
-                        export_to_video(output, result_video_path, fps=16)
+                        output_np = output.permute(0, 2, 3, 1).numpy()
+                        export_to_video(output_np, result_video_path, fps=16)
+                generated_frames = tensor_video_to_pil_frames(output)
                 dist.barrier()
                 del output
                 clear_cuda_cache()
 
                 # update memory bank
                 if memory_bank is not None:
-                    with timer.track("[IO] Reload results for memory update* (need to be optimized)"):
-                        gen_frames = load_video(result_video_path)
-                    memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
+                    memory_bank.update_memory(gen_frames=generated_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
+                del generated_frames
                 dist.barrier()
 
             if memory_bank is not None:

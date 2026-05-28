@@ -414,8 +414,7 @@ class CameraSelector:
         self.feature_extractor = feature_extractor
         self.model = None
         self.transform = None
-
-        self._load_model(feature_extractor)
+        self.processor = None
 
     def _load_model(self, extractor: str):
         """Load the pretrained model."""
@@ -426,6 +425,20 @@ class CameraSelector:
             self.model = AutoModel.from_pretrained(model_path).to(self.device)
         else:
             raise ValueError(f"Unknown feature extractor: {extractor}")
+
+    def ensure_model(self):
+        if self.model is None:
+            self._load_model(self.feature_extractor)
+        else:
+            self.model.to(self.device)
+        self.model.eval()
+        return self.model
+
+    def offload_model(self):
+        if self.model is not None:
+            self.model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def extract_image_features(self, images: List[np.ndarray]) -> np.ndarray:
@@ -439,21 +452,25 @@ class CameraSelector:
             features: (N, D) feature vectors.
         """
 
+        self.ensure_model()
         features = []
-        for img in images:
-            # RGB -> PIL
-            img_pil = Image.fromarray(img)
+        try:
+            for img in images:
+                # RGB -> PIL
+                img_pil = Image.fromarray(img)
 
-            # Extract
-            if self.feature_extractor == 'dinov2':
-                with torch.no_grad():
-                    inputs = self.processor(images=img_pil, return_tensors="pt")
-                    inputs.pixel_values = inputs.pixel_values.to(self.device)
-                    feat = self.model(pixel_values=inputs.pixel_values).pooler_output  # (1, 768)
-            else:
-                raise ValueError(f"Unknown feature extractor: {self.feature_extractor}")
+                # Extract
+                if self.feature_extractor == 'dinov2':
+                    with torch.no_grad():
+                        inputs = self.processor(images=img_pil, return_tensors="pt")
+                        inputs.pixel_values = inputs.pixel_values.to(self.device)
+                        feat = self.model(pixel_values=inputs.pixel_values).pooler_output  # (1, 768)
+                else:
+                    raise ValueError(f"Unknown feature extractor: {self.feature_extractor}")
 
-            features.append(feat.cpu().numpy().flatten())
+                features.append(feat.cpu().numpy().flatten())
+        finally:
+            self.offload_model()
 
         return np.array(features)
 
@@ -766,12 +783,7 @@ class PanoramaMemoryBank:
         else:
             self.results_path = f"generation_bank_{results_name}"
 
-        # predefine 2d points
-        x = torch.arange(image_width).float()
-        y = torch.arange(image_height).float()
-        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
-        points = einops.rearrange(points, 'w h c -> (h w) c')
-        self.points = point_padding(points).to(device)
+        self._points = None
 
         # build panoramic memory bank
         memory_bank_path = f"{root_path}/render_results/pano_bank"
@@ -846,6 +858,20 @@ class PanoramaMemoryBank:
         self.sam3_model.eval()
         self._aux_models_deferred = False
         return self.moge_model, self.sam3_model, self.sam3_processor
+
+    def get_points(self):
+        if self._points is None or self._points.device != self.device:
+            x = torch.arange(self.image_width).float()
+            y = torch.arange(self.image_height).float()
+            points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
+            points = einops.rearrange(points, 'w h c -> (h w) c')
+            self._points = point_padding(points).to(self.device)
+        return self._points
+
+    def release_points(self):
+        self._points = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def export_pcd(self, save_path, N_points=2_000_000):
         """
@@ -1808,7 +1834,7 @@ class PanoramaMemoryBank:
                 rgb_colors = torch.from_numpy(np.array(gen_frames[local_i]).reshape(-1, 3)).to(self.device, dtype=torch.float32)
                 update_points3d, update_rgb = depth2pcd(
                     updated_tar_w2cs[local_i], updated_tar_Ks[local_i],
-                    self.points.clone(), aligned_depth, rgb_colors, update_mask
+                    self.get_points().clone(), aligned_depth, rgb_colors, update_mask
                 )
                 update_points3d = update_points3d.cpu().numpy()
                 update_rgb = update_rgb.cpu().numpy().astype(np.uint8)
@@ -1829,6 +1855,7 @@ class PanoramaMemoryBank:
 
             n_aligned = len(video_camera_dicts.get(video_name, {}))
             color_print(f"[Rank{self.rank}] Video {video_name}: {n_aligned} frames aligned with depth & pointcloud.", "info")
+        self.release_points()
 
         # =====================================================================
         # Phase 6.5: Filter outlier points after video-level aggregation with Statistical Outlier Removal.

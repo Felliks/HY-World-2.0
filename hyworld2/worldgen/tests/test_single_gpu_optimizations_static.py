@@ -59,3 +59,26 @@ def test_memory_bank_can_defer_aux_models_until_alignment():
     assert "def ensure_aux_models" in source
     assert "self.ensure_aux_models(" in source
     assert "self._aux_models_deferred" in source
+
+
+def test_camera_selector_and_alignment_points_are_lazy_gpu_residents():
+    source = read_source("src/retrieval_wm.py")
+
+    assert "def ensure_model" in source
+    assert "def offload_model" in source
+    assert "self.model = None" in source
+    assert "self._load_model(feature_extractor)" not in source
+    assert "self._points = None" in source
+    assert "def get_points" in source
+    assert "def release_points" in source
+    assert "self.release_points()" in source
+
+
+def test_video_gen_reuses_generated_frames_without_mp4_decode_roundtrip():
+    source = read_source("video_gen.py")
+
+    assert "def load_validated_video" in source
+    assert "def tensor_video_to_pil_frames" in source
+    assert "generated_frames = tensor_video_to_pil_frames(output)" in source
+    assert "memory_bank.update_memory(gen_frames=generated_frames" in source
+    assert "Reload results for memory update" not in source
